@@ -1,6 +1,7 @@
 use super::*;
 use crate::os_input_output::ServerOsApi;
 use crate::plugins::PluginInstruction;
+use crate::session_layout_metadata::{PaneLayoutMetadata, SessionLayoutMetadata};
 use crate::thread_bus::Bus;
 use interprocess::local_socket::Stream as LocalSocketStream;
 use std::collections::HashMap;
@@ -8,10 +9,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zellij_utils::channels::{self, SenderWithContext};
-use zellij_utils::data::{Event, Palette};
+use zellij_utils::data::{Event, GetPaneCwdResponse, Palette};
 use zellij_utils::errors::ErrorContext;
-use zellij_utils::input::command::RunCommand;
+use zellij_utils::input::{
+    command::{RunCommand, TerminalAction},
+    layout::{PluginAlias, RunPluginOrAlias},
+};
 use zellij_utils::ipc::{ClientToServerMsg, IpcReceiverWithContext, ServerToClientMsg};
+use zellij_utils::pane_size::{PaneGeom, Size};
+use zellij_utils::session_serialization::GlobalLayoutManifest;
 
 #[derive(Clone)]
 struct MockOsApi {
@@ -189,6 +195,62 @@ fn collect_command_changed_events(
         }
     }
     events
+}
+
+struct CollectedPtyEvents {
+    cwd_changed: Vec<(PaneId, PathBuf)>,
+    command_changed: Vec<(PaneId, Vec<String>, bool)>,
+}
+
+fn collect_pty_events(
+    rx: &channels::Receiver<(PluginInstruction, ErrorContext)>,
+) -> CollectedPtyEvents {
+    let mut events = CollectedPtyEvents {
+        cwd_changed: Vec::new(),
+        command_changed: Vec::new(),
+    };
+    while let Ok((instruction, _)) = rx.try_recv() {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (_, _, event) in updates {
+                match event {
+                    Event::CwdChanged(pane_id, cwd, _) => {
+                        events.cwd_changed.push((pane_id.into(), cwd));
+                    },
+                    Event::CommandChanged(pane_id, cmd, is_foreground, _) => {
+                        events
+                            .command_changed
+                            .push((pane_id.into(), cmd, is_foreground));
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+    events
+}
+
+fn default_terminal_action() -> TerminalAction {
+    TerminalAction::RunCommand(RunCommand {
+        command: PathBuf::from("pwsh"),
+        ..Default::default()
+    })
+}
+
+fn terminal_action_cwd(terminal_action: &TerminalAction) -> Option<PathBuf> {
+    match terminal_action {
+        TerminalAction::RunCommand(run_command) => run_command.cwd.clone(),
+        TerminalAction::OpenFile(payload) => payload.cwd.clone(),
+    }
+}
+
+fn terminal_cwd_path(pty: &Pty, terminal_id: u32) -> Option<PathBuf> {
+    pty.terminal_cwds
+        .get(&terminal_id)
+        .map(|cwd| cwd.path().clone())
+}
+
+fn terminal_cwd_source(pty: &Pty, terminal_id: u32) -> Option<TerminalCwdSource> {
+    pty.terminal_cwds.get(&terminal_id).map(|cwd| cwd.source)
 }
 
 #[test]
@@ -389,6 +451,7 @@ fn cwd_changed_event_emitted_on_change() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, PaneId::Terminal(1));
     assert_eq!(events[0].1, PathBuf::from("/home/user"));
+    assert_eq!(terminal_cwd_source(&pty, 1), Some(TerminalCwdSource::Process));
 }
 
 #[test]
@@ -398,12 +461,14 @@ fn no_cwd_event_when_unchanged() {
     mock.set_cwd(child_pid, PathBuf::from("/home/user"));
     let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
     set_active_terminal(&mut pty, 1, child_pid);
-    pty.terminal_cwds.insert(1, PathBuf::from("/home/user"));
+    pty.terminal_cwds
+        .insert(1, TerminalCwd::process(PathBuf::from("/home/user")));
 
     pty.update_and_report_cwds();
 
     let events = collect_cwd_changed_events(&rx);
     assert!(events.is_empty(), "no event expected when cwd unchanged");
+    assert_eq!(terminal_cwd_source(&pty, 1), Some(TerminalCwdSource::Process));
 }
 
 // --- OSC7 CWD notification ---
@@ -421,9 +486,258 @@ fn osc7_emits_cwd_changed() {
     assert_eq!(events[0].0, PaneId::Terminal(1));
     assert_eq!(events[0].1, PathBuf::from("/tmp/new"));
     assert_eq!(
-        pty.terminal_cwds.get(&1),
-        Some(&PathBuf::from("/tmp/new")),
+        terminal_cwd_path(&pty, 1),
+        Some(PathBuf::from("/tmp/new")),
         "cache should be updated"
+    );
+    assert_eq!(
+        terminal_cwd_source(&pty, 1),
+        Some(TerminalCwdSource::ShellReported)
+    );
+}
+
+#[test]
+fn session_layout_metadata_prefers_osc7_cwd_over_process_cwd() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+
+    let mut session_layout_metadata = SessionLayoutMetadata::default();
+    session_layout_metadata.add_tab(
+        "tab1".to_string(),
+        true,
+        false,
+        vec![PaneLayoutMetadata::new(
+            PaneId::Terminal(1),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            true,
+            None,
+            vec![],
+            None,
+            None,
+        )],
+        vec![],
+    );
+
+    pty.populate_session_layout_metadata(&mut session_layout_metadata);
+    let manifest: GlobalLayoutManifest = session_layout_metadata.into();
+
+    assert_eq!(manifest.global_cwd, Some(PathBuf::from("/cwd-from-osc7")));
+}
+
+#[test]
+fn process_cwd_poll_does_not_overwrite_osc7_cwd() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    mock.set_foreground_cmd(child_pid, vec!["vim".into()]);
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+    pty.pane_activity_flags
+        .get(&1)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+
+    pty.update_and_report_cwds();
+
+    assert_eq!(
+        terminal_cwd_path(&pty, 1),
+        Some(PathBuf::from("/cwd-from-osc7"))
+    );
+    assert_eq!(
+        terminal_cwd_source(&pty, 1),
+        Some(TerminalCwdSource::ShellReported)
+    );
+    let events = collect_pty_events(&rx);
+    assert!(
+        events.cwd_changed.is_empty(),
+        "stale process cwd should not emit a cwd change after OSC 7"
+    );
+    assert_eq!(events.command_changed.len(), 1);
+    assert_eq!(events.command_changed[0].1, vec!["vim"]);
+}
+
+#[test]
+fn fill_cwd_prefers_osc7_cwd_for_focused_terminal() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.active_panes.insert(1, PaneId::Terminal(1));
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+    let mut terminal_action = default_terminal_action();
+
+    pty.fill_cwd(&mut terminal_action, 1);
+
+    assert_eq!(
+        terminal_action_cwd(&terminal_action),
+        Some(PathBuf::from("/cwd-from-osc7"))
+    );
+}
+
+#[test]
+fn fill_cwd_falls_back_to_process_cwd_without_osc7() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/process-cwd"));
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.active_panes.insert(1, PaneId::Terminal(1));
+    let mut terminal_action = default_terminal_action();
+
+    pty.fill_cwd(&mut terminal_action, 1);
+
+    assert_eq!(
+        terminal_action_cwd(&terminal_action),
+        Some(PathBuf::from("/process-cwd"))
+    );
+}
+
+#[test]
+fn fill_cwd_from_pane_id_prefers_osc7_cwd_for_terminal_pane() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+    let mut terminal_action = default_terminal_action();
+
+    pty.fill_cwd_from_pane_id(&mut terminal_action, &PaneId::Terminal(1));
+
+    assert_eq!(
+        terminal_action_cwd(&terminal_action),
+        Some(PathBuf::from("/cwd-from-osc7"))
+    );
+}
+
+#[test]
+fn fill_plugin_cwd_prefers_osc7_cwd_for_focused_terminal() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.active_panes.insert(1, PaneId::Terminal(1));
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+
+    pty.fill_plugin_cwd(
+        None,
+        false,
+        false,
+        None,
+        RunPluginOrAlias::from_url("zellij:session-manager", &None, None, None).unwrap(),
+        0,
+        None,
+        1,
+        Size::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let (instruction, _) = rx.try_recv().unwrap();
+    match instruction {
+        PluginInstruction::Load(_, _, _, _, _, _, _, _, _, cwd, _, _, _, _, _) => {
+            assert_eq!(cwd, Some(PathBuf::from("/cwd-from-osc7")));
+        },
+        other => panic!("expected plugin load instruction, got {:?}", other),
+    }
+}
+
+#[test]
+fn fill_plugin_cwd_sets_alias_caller_cwd_from_osc7_cwd() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.active_panes.insert(1, PaneId::Terminal(1));
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+
+    pty.fill_plugin_cwd(
+        None,
+        false,
+        false,
+        None,
+        RunPluginOrAlias::Alias(PluginAlias {
+            name: "filepicker".into(),
+            ..Default::default()
+        }),
+        0,
+        None,
+        1,
+        Size::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let (instruction, _) = rx.try_recv().unwrap();
+    match instruction {
+        PluginInstruction::Load(
+            _,
+            _,
+            _,
+            _,
+            RunPluginOrAlias::Alias(alias),
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) => {
+            let caller_cwd = alias
+                .configuration
+                .as_ref()
+                .and_then(|configuration| configuration.inner().get("caller_cwd"));
+            assert_eq!(caller_cwd, Some(&"/cwd-from-osc7".to_string()));
+        },
+        other => panic!("expected plugin alias load instruction, got {:?}", other),
+    }
+}
+
+#[test]
+fn get_pane_cwd_prefers_osc7_cwd() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cwd(child_pid, PathBuf::from("/stale-process-cwd"));
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.notify_cwd_from_osc7(1, PathBuf::from("/cwd-from-osc7"));
+    let _ = collect_cwd_changed_events(&rx);
+
+    let response = pty.get_pane_cwd(PaneId::Terminal(1));
+
+    assert_eq!(
+        response,
+        GetPaneCwdResponse::Ok(PathBuf::from("/cwd-from-osc7"))
     );
 }
 
@@ -432,7 +746,8 @@ fn osc7_no_event_when_unchanged() {
     let mock = MockOsApi::new();
     let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
     pty.id_to_child_pid.insert(1, 100);
-    pty.terminal_cwds.insert(1, PathBuf::from("/same"));
+    pty.terminal_cwds
+        .insert(1, TerminalCwd::shell_reported(PathBuf::from("/same")));
 
     pty.notify_cwd_from_osc7(1, PathBuf::from("/same"));
 
@@ -470,10 +785,9 @@ fn osc7_then_poll_skips_terminal() {
     assert_eq!(osc7_events.len(), 1);
 
     pty.update_and_report_cwds();
-    let cwd_events = collect_cwd_changed_events(&rx);
-    let cmd_events = collect_command_changed_events(&rx);
+    let events = collect_pty_events(&rx);
     assert!(
-        cwd_events.is_empty() && cmd_events.is_empty(),
+        events.cwd_changed.is_empty() && events.command_changed.is_empty(),
         "poll after osc7 should skip terminal since flag was cleared"
     );
 }

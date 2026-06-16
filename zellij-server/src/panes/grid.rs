@@ -375,7 +375,18 @@ pub fn parse_osc7_path(raw: &[u8]) -> Option<std::path::PathBuf> {
             i += 1;
         }
     }
-    let decoded = String::from_utf8(out).ok()?;
+    let mut decoded = String::from_utf8(out).ok()?;
+    #[cfg(windows)]
+    {
+        let bytes = decoded.as_bytes();
+        if bytes.len() > 2
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            decoded.remove(0);
+        }
+    }
     Some(std::path::PathBuf::from(decoded))
 }
 
@@ -5009,6 +5020,16 @@ mod osc7_parser_tests {
     fn osc7_parser_decodes_percent_encoded_path() {
         let raw = b"file://localhost/tmp/with%20space";
         assert_eq!(parse_osc7_path(raw), Some(PathBuf::from("/tmp/with space")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn osc7_parser_normalizes_drive_letter_path_on_windows() {
+        let raw = b"file://host/C:/workspace/project";
+        assert_eq!(
+            parse_osc7_path(raw),
+            Some(PathBuf::from("C:/workspace/project"))
+        );
     }
 
     #[test]
